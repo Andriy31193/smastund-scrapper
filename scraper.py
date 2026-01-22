@@ -49,7 +49,6 @@ class VinnustundScraper:
         if cookies:
             self.session.cookies.update(cookies)
             logger.info(f"✓ Cookies loaded into session: {len(cookies)} cookies")
-            logger.debug(f"Cookie names: {list(cookies.keys())}")
         else:
             logger.warning("⚠ No cookies provided - session may not be authenticated")
     
@@ -57,8 +56,6 @@ class VinnustundScraper:
         """Update cookies in the session"""
         self.session.cookies.update(cookies)
         logger.info(f"✓ Cookies updated: {len(cookies)} cookies")
-        for name, value in cookies.items():
-            logger.debug(f"  - {name}: {value[:30]}..." if len(str(value)) > 30 else f"  - {name}: {value}")
     
     def _add_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Add random delay to simulate human behavior"""
@@ -113,8 +110,6 @@ class VinnustundScraper:
         
         # Log current session state
         logger.info(f"Current cookies in session: {len(self.session.cookies)} cookies")
-        for cookie in self.session.cookies:
-            logger.debug(f"  - {cookie.name}: {cookie.value[:20]}..." if len(cookie.value) > 20 else f"  - {cookie.name}: {cookie.value}")
         
         try:
             # Step 1: First GET the page to get the form with all hidden fields
@@ -143,7 +138,6 @@ class VinnustundScraper:
             
             if not form:
                 logger.error("✗ Could not find detail_form on initial page")
-                logger.debug(f"Response snippet (first 1000 chars): {initial_response.text[:1000]}")
                 raise Exception("Could not find form on page. Session may be invalid.")
             
             logger.info("✓ Found detail_form")
@@ -155,7 +149,6 @@ class VinnustundScraper:
                 value = input_field.get('value', '')
                 if name:
                     hidden_inputs[name] = value
-                    logger.debug(f"  Found hidden field: {name} = {value[:50]}")
             
             logger.info(f"Extracted {len(hidden_inputs)} hidden form fields")
             
@@ -174,7 +167,6 @@ class VinnustundScraper:
                 form_data['showBak'] = 'true'
             
             logger.info(f"Submitting form with {len(form_data)} fields")
-            logger.debug(f"Form data keys: {list(form_data.keys())}")
             
             # Step 3: Submit the form
             self._add_delay(1.0, 2.0)
@@ -200,46 +192,12 @@ class VinnustundScraper:
                 logger.error(f"✗ POST failed with status code {response.status_code}")
                 raise Exception(f"Received status code {response.status_code}")
             
-            # Log response snippet for debugging
-            response_snippet = response.text[:500] if len(response.text) > 500 else response.text
-            logger.debug(f"Response snippet (first 500 chars): {response_snippet}")
-            
             # Check for common indicators in the response
             has_timesheet = 'Timesheet' in response.text or 'timesheet' in response.text.lower()
-            # Check for period in various formats
-            period_patterns = [
-                f'Period: {date_from}',
-                f'Period: {date_from.replace(".", "-")}',
-                f'timabilFra" value="{date_from}',
-                f'timabilTil" value="{date_to}',
-            ]
-            has_period = any(pattern in response.text for pattern in period_patterns)
             has_table_control = 'clsTableControl' in response.text
             has_detail_form = 'detail_form' in response.text
             
-            logger.info(f"Response indicators: Timesheet={has_timesheet}, Period={has_period}, TableControl={has_table_control}, DetailForm={has_detail_form}")
-            
-            # Check if the form still has our date values
-            if has_detail_form:
-                soup_temp = BeautifulSoup(response.text, 'html.parser')
-                form = soup_temp.find('form', {'name': 'detail_form'})
-                if form:
-                    fra_input = form.find('input', {'name': 'timabilFra'})
-                    til_input = form.find('input', {'name': 'timabilTil'})
-                    if fra_input:
-                        fra_value = fra_input.get('value', '')
-                        logger.info(f"Form timabilFra value: '{fra_value}' (expected: '{date_from}')")
-                    if til_input:
-                        til_value = til_input.get('value', '')
-                        logger.info(f"Form timabilTil value: '{til_value}' (expected: '{date_to}')")
-            
-            # Save response to file for debugging (optional, can be removed later)
-            try:
-                with open('last_response.html', 'w', encoding='utf-8') as f:
-                    f.write(response.text)
-                logger.debug("Saved response HTML to last_response.html for debugging")
-            except Exception as e:
-                logger.debug(f"Could not save response file: {e}")
+            logger.info(f"Response indicators: Timesheet={has_timesheet}, TableControl={has_table_control}, DetailForm={has_detail_form}")
             
             # Parse the HTML
             logger.info("Step 3: Parsing HTML response...")
@@ -286,11 +244,6 @@ class VinnustundScraper:
             
             logger.info(f"✓ Using table with class 'clsTableControl' ({len(table.find_all('tr'))} rows)")
             
-            # Debug: Log table structure
-            logger.debug("Table HTML structure:")
-            table_html = str(table)[:1000]  # First 1000 chars
-            logger.debug(f"Table HTML (first 1000 chars): {table_html}")
-            
             # Check for tbody
             tbody = table.find('tbody')
             if tbody:
@@ -308,25 +261,10 @@ class VinnustundScraper:
             all_rows_all = table.find_all('tr')
             logger.debug(f"Total <tr> elements found: {len(all_rows_direct)} direct, {len(all_rows_all)} total (recursive)")
             
-            # Log first few rows for debugging
-            rows_to_log = all_rows_all[:10] if all_rows_all else []
-            for i, row in enumerate(rows_to_log, 1):
-                row_text = row.get_text(strip=True)[:100]  # First 100 chars
-                row_classes = row.get('class', [])
-                row_id = row.get('id', '')
-                logger.debug(f"  Row {i}: id='{row_id}', classes={row_classes}, text preview='{row_text}'")
-                tds = row.find_all('td')
-                logger.debug(f"    - Has {len(tds)} <td> elements")
-                if tds:
-                    first_td_text = tds[0].get_text(strip=True)[:50]
-                    first_td_classes = tds[0].get('class', [])
-                    logger.debug(f"    - First td: classes={first_td_classes}, text='{first_td_text}'")
-            
-            # Check if table might be empty because there's no data for this date range
+            # Check if table might be empty
             table_text = table.get_text(strip=True)
             if not table_text or len(table_text) < 50:
                 logger.warning("⚠ Table appears to be empty or nearly empty")
-                logger.debug(f"Table text content: '{table_text[:200]}'")
             
             # Parse table rows
             shifts = self._parse_table(table)
@@ -369,12 +307,6 @@ class VinnustundScraper:
         
         if len(rows) == 0:
             logger.warning("⚠ No rows found in table!")
-            # Try to see what's actually in the table
-            table_text = table.get_text(strip=True)
-            if table_text:
-                logger.debug(f"Table text content (first 200 chars): {table_text[:200]}")
-            else:
-                logger.warning("Table appears to be completely empty")
             return []
         
         # Skip header rows (first two rows are usually headers)
@@ -410,7 +342,7 @@ class VinnustundScraper:
             shift = self._parse_shift_row(row)
             if shift:
                 shifts.append(shift)
-                logger.debug(f"  Parsed shift {i}: {shift.get('date', 'N/A')} - {shift.get('timeEntered', 'N/A')}")
+                logger.debug(f"  Parsed shift {i}")
             else:
                 logger.debug(f"  Row {i}: Failed to parse")
         
@@ -573,8 +505,6 @@ class VinnustundScraper:
         """
         logger.info("Testing authentication...")
         logger.info(f"Current cookies: {len(self.session.cookies)}")
-        for cookie in self.session.cookies:
-            logger.info(f"  - {cookie.name}: {cookie.value[:50]}...")
         
         try:
             self._add_delay(0.5, 1.0)

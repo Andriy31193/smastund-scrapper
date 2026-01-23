@@ -4,6 +4,9 @@ import time
 import logging
 from typing import List, Dict, Optional
 import random
+import threading
+from datetime import datetime, timedelta
+from http.cookiejar import Cookie
 
 logger = logging.getLogger(__name__)
 
@@ -16,15 +19,27 @@ class VinnustundScraper:
     BASE_URL = "https://kopavogur.vinnustund.is"
     TIMESHEET_URL = f"{BASE_URL}/VS_MX/starfsmadur/starfsm_timafaerslur_view.jsp"
     
-    def __init__(self, cookies: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None):
+    def __init__(self, cookies: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None, 
+                 keep_alive_interval: int = 300, enable_keep_alive: bool = True,
+                 cookie_expiration_years: int = 70):
         """
         Initialize the scraper with session management.
         
         Args:
             cookies: Dictionary of cookies to use (if None, will need to be set manually)
             headers: Custom headers (if None, uses default browser-like headers)
+            keep_alive_interval: Interval in seconds between keep-alive actions (default: 300 = 5 minutes)
+            enable_keep_alive: Whether to enable background keep-alive thread (default: True)
+            cookie_expiration_years: Number of years to extend cookie expiration (default: 70 = ~2096)
         """
         self.session = requests.Session()
+        self.keep_alive_interval = keep_alive_interval
+        self.enable_keep_alive = enable_keep_alive
+        self.cookie_expiration_years = cookie_expiration_years
+        self.keep_alive_thread = None
+        self.keep_alive_running = False
+        self.last_activity = datetime.now()
+        self._lock = threading.Lock()
         
         # Set default browser-like headers
         self.default_headers = {
@@ -48,14 +63,105 @@ class VinnustundScraper:
         # Set cookies if provided
         if cookies:
             self.session.cookies.update(cookies)
+            self._extend_cookie_expiration(self.cookie_expiration_years)
             logger.info(f"✓ Cookies loaded into session: {len(cookies)} cookies")
         else:
             logger.warning("⚠ No cookies provided - session may not be authenticated")
+        
+        # Start keep-alive thread if enabled
+        if self.enable_keep_alive:
+            self.start_keep_alive()
+    
+    def _extend_cookie_expiration(self, expiration_years: int = 70):
+        """
+        Extend expiration dates for session cookies (especially JSESSIONID).
+        Sets expiration to a far future date (default: 70 years = ~2096).
+        
+        Args:
+            expiration_years: Number of years in the future to set expiration (default: 70)
+        """
+        try:
+            future_date = datetime.now() + timedelta(days=expiration_years * 365)
+            future_timestamp = int(future_date.timestamp())
+            
+            extended_count = 0
+            
+            # Get all cookies and update their expiration
+            for cookie in list(self.session.cookies):
+                try:
+                    # Extend expiration for:
+                    # 1. JSESSIONID (most important)
+                    # 2. Session cookies (expires == 0 or None)
+                    # 3. Cookies expiring soon (within 30 days)
+                    should_extend = (
+                        cookie.name == 'JSESSIONID' or
+                        cookie.expires == 0 or
+                        cookie.expires is None or
+                        (cookie.expires and cookie.expires < time.time() + (30 * 24 * 60 * 60))
+                    )
+                    
+                    if should_extend:
+                        # Update the cookie's expiration
+                        cookie.expires = future_timestamp
+                        # Also update the cookie in the jar
+                        self.session.cookies.set_cookie(cookie)
+                        extended_count += 1
+                        logger.debug(f"Extended expiration for cookie: {cookie.name} to {future_date.strftime('%Y-%m-%d')}")
+                        
+                except (AttributeError, TypeError) as e:
+                    # Some cookies might not have expires attribute or it might be read-only
+                    logger.debug(f"Could not extend expiration for {cookie.name}: {e}")
+                    continue
+                except Exception as e:
+                    logger.debug(f"Unexpected error extending {cookie.name}: {e}")
+                    continue
+            
+            if extended_count > 0:
+                logger.debug(f"Extended expiration for {extended_count} cookie(s) to {expiration_years} years in the future")
+        except Exception as e:
+            logger.warning(f"Error extending cookie expiration: {str(e)}")
     
     def set_cookies(self, cookies: Dict[str, str]):
-        """Update cookies in the session"""
+        """Update cookies in the session and extend their expiration"""
         self.session.cookies.update(cookies)
+        self._extend_cookie_expiration(self.cookie_expiration_years)
         logger.info(f"✓ Cookies updated: {len(cookies)} cookies")
+    
+    def get_cookie_expiration_info(self) -> Dict:
+        """
+        Get information about cookie expiration dates.
+        
+        Returns:
+            Dictionary with cookie expiration information
+        """
+        info = {
+            'cookies': [],
+            'expiration_years': self.cookie_expiration_years
+        }
+        
+        for cookie in self.session.cookies:
+            cookie_info = {
+                'name': cookie.name,
+                'domain': cookie.domain,
+            }
+            
+            if cookie.expires:
+                if cookie.expires == 0:
+                    cookie_info['expires'] = 'Session cookie (no expiration)'
+                    cookie_info['expires_timestamp'] = 0
+                else:
+                    expires_date = datetime.fromtimestamp(cookie.expires)
+                    cookie_info['expires'] = expires_date.strftime('%Y-%m-%d %H:%M:%S')
+                    cookie_info['expires_timestamp'] = cookie.expires
+                    days_until_expiry = (expires_date - datetime.now()).days
+                    cookie_info['days_until_expiry'] = days_until_expiry
+            else:
+                cookie_info['expires'] = 'No expiration set'
+                cookie_info['expires_timestamp'] = None
+            
+            info['cookies'].append(cookie_info)
+        
+        return info
     
     def _add_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Add random delay to simulate human behavior"""
@@ -66,6 +172,14 @@ class VinnustundScraper:
         """Check if session is still valid based on response"""
         logger.debug(f"Checking session validity - Status: {response.status_code}, URL: {response.url}")
         
+        # Check response size - very small responses (< 1000 bytes) often indicate redirects or errors
+        if len(response.text) < 1000:
+            logger.warning(f"⚠ Suspiciously small response: {len(response.text)} bytes - may indicate session expiration")
+            # Check if it's a redirect or error page
+            if 'login' in response.text.lower() or 'VSLogin' in response.text or len(response.text) < 500:
+                logger.error("✗ Session invalid: Response too small, likely expired")
+                return False
+        
         # Check for redirects to login or error pages
         if response.status_code in [401, 403]:
             logger.error(f"✗ Session invalid: HTTP {response.status_code}")
@@ -73,7 +187,7 @@ class VinnustundScraper:
         
         # Check if redirected to login page
         if 'login' in response.url.lower() or 'VSLogin' in response.url:
-            logger.error(f"✗ Session invalid: Redirected to login page: {response.url}")
+            logger.error(f"✗ Session invalid: Redirected to login page")
             return False
         
         # Check response content for login indicators
@@ -86,12 +200,134 @@ class VinnustundScraper:
                     return False
             
             # Check for successful authentication indicators
-            if 'starfsm_timafaerslur_view.jsp' in response.url or 'clsTableControl' in response.text:
+            if 'starfsm_timafaerslur_view.jsp' in response.url or 'clsTableControl' in response.text or 'detail_form' in response.text:
                 logger.info("✓ Session appears valid - found timesheet content")
                 return True
         
         logger.warning("⚠ Could not definitively determine session validity")
         return True
+    
+    def _perform_keep_alive_action(self) -> bool:
+        """
+        Perform a random keep-alive action to simulate user activity.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            # Random delay to simulate human behavior
+            self._add_delay(0.5, 2.0)
+            
+            # List of pages to visit (simulating user navigation)
+            keep_alive_urls = [
+                self.TIMESHEET_URL + "?sj=true",
+                self.BASE_URL + "/VS_MX/starfsmadur/starfsmadur_view.jsp?sj=true",
+                self.BASE_URL + "/VS_MX/adalsida.jsp",
+            ]
+            
+            # Randomly select a URL
+            url = random.choice(keep_alive_urls)
+            
+            with self._lock:
+                self.session.headers['Referer'] = self.BASE_URL
+                response = self.session.get(url, timeout=15)
+                # Extend cookie expiration after each request to keep session alive
+                self._extend_cookie_expiration(self.cookie_expiration_years)
+                self.last_activity = datetime.now()
+            
+            if self._check_session_valid(response):
+                logger.debug(f"Keep-alive action successful: {url}")
+                return True
+            else:
+                logger.warning("Keep-alive action detected session expiration")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Keep-alive action failed: {str(e)}")
+            return False
+    
+    def _keep_alive_worker(self):
+        """Background worker thread for keep-alive actions"""
+        logger.info(f"Keep-alive thread started (interval: {self.keep_alive_interval}s)")
+        
+        while self.keep_alive_running:
+            try:
+                # Wait for the interval
+                time.sleep(self.keep_alive_interval)
+                
+                if not self.keep_alive_running:
+                    break
+                
+                # Check if we need to perform keep-alive
+                time_since_activity = (datetime.now() - self.last_activity).total_seconds()
+                
+                if time_since_activity >= self.keep_alive_interval:
+                    logger.debug("Performing scheduled keep-alive action...")
+                    self._perform_keep_alive_action()
+                else:
+                    logger.debug(f"Skipping keep-alive (last activity {int(time_since_activity)}s ago)")
+                    
+            except Exception as e:
+                logger.error(f"Error in keep-alive worker: {str(e)}")
+                time.sleep(60)  # Wait a minute before retrying
+        
+        logger.info("Keep-alive thread stopped")
+    
+    def start_keep_alive(self):
+        """Start the background keep-alive thread"""
+        if not self.enable_keep_alive:
+            return
+        
+        if self.keep_alive_thread is None or not self.keep_alive_thread.is_alive():
+            self.keep_alive_running = True
+            self.keep_alive_thread = threading.Thread(target=self._keep_alive_worker, daemon=True)
+            self.keep_alive_thread.start()
+            logger.info("Background keep-alive thread started")
+    
+    def stop_keep_alive(self):
+        """Stop the background keep-alive thread"""
+        if self.keep_alive_running:
+            self.keep_alive_running = False
+            logger.info("Stopping keep-alive thread...")
+            if self.keep_alive_thread:
+                self.keep_alive_thread.join(timeout=5)
+    
+    def _ensure_session_valid(self) -> bool:
+        """
+        Ensure session is valid before making requests.
+        Performs a quick check and refresh if needed.
+        """
+        try:
+            with self._lock:
+                # Quick check - visit the main page
+                response = self.session.get(
+                    self.TIMESHEET_URL + "?sj=true",
+                    timeout=15
+                )
+                # Extend cookie expiration
+                self._extend_cookie_expiration(self.cookie_expiration_years)
+                
+                if not self._check_session_valid(response):
+                    logger.warning("Session appears invalid, attempting refresh...")
+                    # Try to refresh by visiting base URL first
+                    self.session.get(self.BASE_URL, timeout=10)
+                    time.sleep(1)
+                    # Then try timesheet again
+                    response = self.session.get(
+                        self.TIMESHEET_URL + "?sj=true",
+                        timeout=15
+                    )
+                    # Extend cookie expiration after refresh
+                    self._extend_cookie_expiration(self.cookie_expiration_years)
+                    
+                    if not self._check_session_valid(response):
+                        logger.error("✗ Could not refresh session")
+                        return False
+                
+                self.last_activity = datetime.now()
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error ensuring session validity: {str(e)}")
+            return False
     
     def get_shifts(self, date_from: str, date_to: str) -> List[Dict]:
         """
@@ -111,10 +347,19 @@ class VinnustundScraper:
         # Log current session state
         logger.info(f"Current cookies in session: {len(self.session.cookies)} cookies")
         
+        # Ensure session is valid before proceeding
+        if not self._ensure_session_valid():
+            raise Exception("Session expired or invalid. Please update cookies.")
+        
         try:
             # Step 1: First GET the page to get the form with all hidden fields
             logger.info("Step 1: Fetching initial page to get form fields...")
             self._add_delay(1.0, 2.0)
+            
+            with self._lock:
+                # Extend cookie expiration after successful request
+                self._extend_cookie_expiration(self.cookie_expiration_years)
+                self.last_activity = datetime.now()
             
             self.session.headers['Referer'] = self.BASE_URL
             initial_response = self.session.get(
@@ -138,7 +383,37 @@ class VinnustundScraper:
             
             if not form:
                 logger.error("✗ Could not find detail_form on initial page")
-                raise Exception("Could not find form on page. Session may be invalid.")
+                logger.info("Attempting session refresh...")
+                
+                # Try to refresh session by visiting base URL and then retrying
+                try:
+                    with self._lock:
+                        self.session.get(self.BASE_URL, timeout=10)
+                        time.sleep(2)
+                        self._add_delay(1.0, 2.0)
+                        retry_response = self.session.get(
+                            self.TIMESHEET_URL + "?sj=true",
+                            timeout=30
+                        )
+                        # Extend cookie expiration after refresh
+                        self._extend_cookie_expiration(self.cookie_expiration_years)
+                        self.last_activity = datetime.now()
+                    
+                    if not self._check_session_valid(retry_response):
+                        raise Exception("Session expired or invalid after refresh. Please update cookies.")
+                    
+                    initial_soup = BeautifulSoup(retry_response.text, 'html.parser')
+                    form = initial_soup.find('form', {'name': 'detail_form'})
+                    
+                    if not form:
+                        raise Exception("Could not find form on page even after refresh. Session may be invalid.")
+                    
+                    logger.info("✓ Session refreshed successfully, form found")
+                    initial_response = retry_response
+                    
+                except Exception as refresh_error:
+                    logger.error(f"Session refresh failed: {str(refresh_error)}")
+                    raise Exception("Could not find form on page. Session may be invalid.")
             
             logger.info("✓ Found detail_form")
             
@@ -170,15 +445,20 @@ class VinnustundScraper:
             
             # Step 3: Submit the form
             self._add_delay(1.0, 2.0)
-            self.session.headers['Referer'] = self.TIMESHEET_URL + "?sj=true"
-            self.session.headers['Content-Type'] = 'application/x-www-form-urlencoded'
             
-            response = self.session.post(
-                self.TIMESHEET_URL,
-                data=form_data,
-                allow_redirects=True,
-                timeout=30
-            )
+            with self._lock:
+                self.session.headers['Referer'] = self.TIMESHEET_URL + "?sj=true"
+                self.session.headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                
+                response = self.session.post(
+                    self.TIMESHEET_URL,
+                    data=form_data,
+                    allow_redirects=True,
+                    timeout=30
+                )
+                # Extend cookie expiration after POST request
+                self._extend_cookie_expiration(self.cookie_expiration_years)
+                self.last_activity = datetime.now()
             
             logger.info(f"POST response - Status: {response.status_code}, URL: {response.url}")
             logger.debug(f"Response length: {len(response.text)} bytes")
@@ -537,16 +817,10 @@ class VinnustundScraper:
         """
         Send a keep-alive request to maintain session.
         Call this periodically (e.g., every 10 minutes) to avoid timeout.
+        Note: If enable_keep_alive=True, this is handled automatically in the background.
         """
-        try:
-            self._add_delay(0.5, 1.0)
-            response = self.session.get(self.BASE_URL, timeout=10)
-            if self._check_session_valid(response):
-                logger.info("Keep-alive successful")
-                return True
-            else:
-                logger.warning("Session may have expired during keep-alive")
-                return False
-        except Exception as e:
-            logger.error(f"Keep-alive failed: {str(e)}")
-            return False
+        return self._perform_keep_alive_action()
+    
+    def __del__(self):
+        """Cleanup when object is destroyed"""
+        self.stop_keep_alive()

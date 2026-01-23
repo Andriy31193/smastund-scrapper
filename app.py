@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from scraper import VinnustundScraper
 import logging
 import os
+import atexit
 from datetime import datetime
 
 app = Flask(__name__)
@@ -30,7 +31,22 @@ except ImportError:
     logger.warning("Could not import config. Using default settings.")
 
 # Initialize scraper instance (reused across requests)
-scraper = VinnustundScraper(cookies=cookies, headers=headers)
+# Keep-alive is enabled by default (runs every 5 minutes)
+# Cookie expiration extended to 70 years (2096) by default
+scraper = VinnustundScraper(
+    cookies=cookies, 
+    headers=headers, 
+    keep_alive_interval=300, 
+    enable_keep_alive=True,
+    cookie_expiration_years=70  # Extend cookies to ~2096
+)
+
+# Register cleanup function to stop keep-alive thread on shutdown
+def cleanup():
+    logger.info("Shutting down, stopping keep-alive thread...")
+    scraper.stop_keep_alive()
+
+atexit.register(cleanup)
 
 @app.route('/retrieve_shifts', methods=['GET', 'POST'])
 def retrieve_shifts():
@@ -97,10 +113,48 @@ def test_auth():
             'error': str(e)
         }), 500
 
+@app.route('/keep_alive', methods=['POST', 'GET'])
+def trigger_keep_alive():
+    """Manually trigger a keep-alive action"""
+    try:
+        success = scraper.keep_alive()
+        return jsonify({
+            'success': success,
+            'message': 'Keep-alive action completed successfully' if success else 'Keep-alive action failed'
+        })
+    except Exception as e:
+        logger.error(f"Error in keep-alive: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/cookie_info', methods=['GET'])
+def cookie_info():
+    """Get information about cookie expiration dates"""
+    try:
+        info = scraper.get_cookie_expiration_info()
+        return jsonify({
+            'success': True,
+            'cookie_info': info
+        })
+    except Exception as e:
+        logger.error(f"Error getting cookie info: {str(e)}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy'})
+    return jsonify({
+        'status': 'healthy',
+        'keep_alive_enabled': scraper.enable_keep_alive,
+        'keep_alive_interval': scraper.keep_alive_interval,
+        'keep_alive_running': scraper.keep_alive_running if hasattr(scraper, 'keep_alive_running') else False,
+        'cookie_expiration_years': scraper.cookie_expiration_years
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

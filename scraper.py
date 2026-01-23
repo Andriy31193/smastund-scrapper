@@ -22,7 +22,7 @@ class VinnustundScraper:
     TIMESHEET_URL = f"{BASE_URL}/VS_MX/starfsmadur/starfsm_timafaerslur_view.jsp"
     
     def __init__(self, cookies: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None, 
-                 keep_alive_interval: int = 300, enable_keep_alive: bool = True,
+                 keep_alive_interval: int = 180, enable_keep_alive: bool = True,
                  cookie_expiration_years: int = 70):
         """
         Initialize the scraper with session management.
@@ -30,7 +30,8 @@ class VinnustundScraper:
         Args:
             cookies: Dictionary of cookies to use (if None, will need to be set manually)
             headers: Custom headers (if None, uses default browser-like headers)
-            keep_alive_interval: Interval in seconds between keep-alive actions (default: 300 = 5 minutes)
+            keep_alive_interval: Interval in seconds between keep-alive actions (default: 180 = 3 minutes)
+                                 More frequent keep-alive helps prevent server-side inactivity expiration
             enable_keep_alive: Whether to enable background keep-alive thread (default: True)
             cookie_expiration_years: Number of years to extend cookie expiration (default: 70 = ~2096)
         """
@@ -63,6 +64,8 @@ class VinnustundScraper:
         self.keep_alive_thread = None
         self.keep_alive_running = False
         self.last_activity = datetime.now()
+        self.last_successful_request = datetime.now()
+        self.consecutive_failures = 0
         self._lock = threading.Lock()
         
         # Set default browser-like headers
@@ -242,7 +245,11 @@ class VinnustundScraper:
             raise Exception(f"Request failed: {str(last_exception)}")
     
     def _check_session_valid(self, response: requests.Response) -> bool:
-        """Check if session is still valid based on response"""
+        """
+        Check if session is still valid based on response.
+        Note: Server-side session expiration cannot be overridden by client-side cookie manipulation.
+        The server may expire sessions after inactivity or a fixed lifetime regardless of cookie expiration.
+        """
         logger.debug(f"Checking session validity - Status: {response.status_code}, URL: {response.url}")
         
         # Check response size - very small responses (< 1000 bytes) often indicate redirects or errors
@@ -250,17 +257,17 @@ class VinnustundScraper:
             logger.warning(f"⚠ Suspiciously small response: {len(response.text)} bytes - may indicate session expiration")
             # Check if it's a redirect or error page
             if 'login' in response.text.lower() or 'VSLogin' in response.text or len(response.text) < 500:
-                logger.error("✗ Session invalid: Response too small, likely expired")
+                logger.error("✗ Session invalid: Response too small, likely expired (server-side expiration)")
                 return False
         
         # Check for redirects to login or error pages
         if response.status_code in [401, 403]:
-            logger.error(f"✗ Session invalid: HTTP {response.status_code}")
+            logger.error(f"✗ Session invalid: HTTP {response.status_code} (server-side expiration)")
             return False
         
         # Check if redirected to login page
         if 'login' in response.url.lower() or 'VSLogin' in response.url:
-            logger.error(f"✗ Session invalid: Redirected to login page")
+            logger.error(f"✗ Session invalid: Redirected to login page (server-side expiration)")
             return False
         
         # Check response content for login indicators
@@ -269,7 +276,7 @@ class VinnustundScraper:
             if 'VSLogin.jsp' in response.text or 'login.jsp' in response.text:
                 # But check if it's actually a login form, not just a link
                 if 'name="username"' in response.text or 'name="password"' in response.text:
-                    logger.error("✗ Session invalid: Login form detected in response")
+                    logger.error("✗ Session invalid: Login form detected in response (server-side expiration)")
                     return False
             
             # Check for successful authentication indicators
@@ -279,6 +286,7 @@ class VinnustundScraper:
         
         logger.warning("⚠ Could not definitively determine session validity")
         return True
+    
     
     def _perform_keep_alive_action(self) -> bool:
         """
@@ -312,14 +320,21 @@ class VinnustundScraper:
                 self.last_activity = datetime.now()
             
             if self._check_session_valid(response):
+                with self._lock:
+                    self.last_successful_request = datetime.now()
+                    self.consecutive_failures = 0
                 logger.debug(f"Keep-alive action successful: {url}")
                 return True
             else:
-                logger.warning("Keep-alive action detected session expiration")
+                with self._lock:
+                    self.consecutive_failures += 1
+                logger.warning(f"Keep-alive action detected session expiration (failures: {self.consecutive_failures})")
                 return False
                 
         except Exception as e:
-            logger.warning(f"Keep-alive action failed: {str(e)}")
+            with self._lock:
+                self.consecutive_failures += 1
+            logger.warning(f"Keep-alive action failed: {str(e)} (failures: {self.consecutive_failures})")
             return False
     
     def _keep_alive_worker(self):
@@ -339,7 +354,18 @@ class VinnustundScraper:
                 
                 if time_since_activity >= self.keep_alive_interval:
                     logger.debug("Performing scheduled keep-alive action...")
-                    self._perform_keep_alive_action()
+                    success = self._perform_keep_alive_action()
+                    
+                    # If keep-alive fails multiple times, warn about potential expiration
+                    with self._lock:
+                        if self.consecutive_failures >= 3:
+                            time_since_success = (datetime.now() - self.last_successful_request).total_seconds()
+                            hours_since_success = time_since_success / 3600
+                            logger.warning(
+                                f"⚠ Multiple keep-alive failures ({self.consecutive_failures}). "
+                                f"Last successful request: {hours_since_success:.1f} hours ago. "
+                                f"Session may be expired - consider refreshing cookies."
+                            )
                 else:
                     logger.debug(f"Skipping keep-alive (last activity {int(time_since_activity)}s ago)")
                     
@@ -405,10 +431,15 @@ class VinnustundScraper:
                         return False
                 
                 self.last_activity = datetime.now()
+                with self._lock:
+                    self.last_successful_request = datetime.now()
+                    self.consecutive_failures = 0
                 return True
                 
         except Exception as e:
             logger.error(f"Error ensuring session validity: {str(e)}")
+            with self._lock:
+                self.consecutive_failures += 1
             return False
     
     def get_shifts(self, date_from: str, date_to: str) -> List[Dict]:
@@ -429,9 +460,13 @@ class VinnustundScraper:
         # Log current session state
         logger.info(f"Current cookies in session: {len(self.session.cookies)} cookies")
         
-        # Ensure session is valid before proceeding
+            # Ensure session is valid before proceeding
         if not self._ensure_session_valid():
-            raise Exception("Session expired or invalid. Please update cookies.")
+            raise Exception(
+                "Session expired or invalid (likely server-side expiration). "
+                "Server-side sessions cannot be extended by client-side cookie manipulation. "
+                "Please log into the website and update cookies in config.py"
+            )
         
         try:
             # Step 1: First GET the page to get the form with all hidden fields
@@ -557,6 +592,9 @@ class VinnustundScraper:
                 # Extend cookie expiration after POST request
                 self._extend_cookie_expiration(self.cookie_expiration_years)
                 self.last_activity = datetime.now()
+                with self._lock:
+                    self.last_successful_request = datetime.now()
+                    self.consecutive_failures = 0
             
             logger.info(f"POST response - Status: {response.status_code}, URL: {response.url}")
             logger.debug(f"Response length: {len(response.text)} bytes")
@@ -657,7 +695,14 @@ class VinnustundScraper:
             logger.error(f"✗ Request error: {str(e)}")
             raise Exception(f"Failed to retrieve shifts: {str(e)}")
         except Exception as e:
-            logger.error(f"✗ Error: {str(e)}")
+            error_msg = str(e)
+            # Check if this might be a server-side session expiration
+            if 'Session expired' in error_msg or 'Session may be invalid' in error_msg or 'Could not find form' in error_msg:
+                logger.error("⚠ Server-side session expiration detected")
+                logger.error("   Server-side sessions cannot be extended by client-side cookie manipulation.")
+                logger.error("   The server may expire sessions after inactivity or a fixed lifetime.")
+                logger.error("   Solution: Update cookies by logging into the website and extracting fresh cookies.")
+            logger.error(f"✗ Error: {error_msg}")
             raise
     
     def _parse_table(self, table: BeautifulSoup) -> List[Dict]:

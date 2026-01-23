@@ -122,21 +122,45 @@ The scraper automatically:
 - Validates session before each request
 - Adds random delays (1-3 seconds) to simulate human behavior
 - Uses browser-like headers to avoid detection
+- Background keep-alive thread (runs every 5 minutes by default)
+- Automatic retry logic for connection errors
+- Cookie expiration extension (extends to ~2096)
+
+### Important: Server-Side Session Expiration
+
+**Server-side session expiration cannot be overridden by client-side cookie manipulation.**
+
+The server maintains its own session state and may expire sessions:
+- After a period of inactivity (e.g., 24 hours)
+- After a fixed maximum lifetime (e.g., 30 days)
+- Based on server-side policies
+
+**What we can do:**
+- ✅ Extend cookie expiration dates (prevents cookie expiration)
+- ✅ Keep session active with periodic requests (reduces inactivity expiration)
+- ✅ Automatically retry on connection errors
+- ❌ Cannot prevent server-side session expiration
+
+**What you need to do:**
+- Periodically refresh cookies by logging into the website
+- Update `config.py` with fresh cookies when sessions expire
+- The keep-alive mechanism helps but may not prevent all server-side expirations
 
 ### Updating Cookies
 
-If you get a "Session expired" error:
+If you get a "Session expired" error (especially "server-side expiration"):
 1. Log into the website in your browser
 2. Extract fresh cookies using DevTools or EditThisCookie extension
 3. Update `config.py` with new cookies
-4. Restart the Flask server
+4. Restart the Flask server (or cookies will be updated on next request)
 
-### Keep-Alive (Optional)
+### Keep-Alive
 
-For long-running sessions, you can periodically call `keep_alive()`:
-```python
-scraper.keep_alive()
-```
+The scraper includes automatic background keep-alive:
+- Runs every 5 minutes (configurable)
+- Visits random pages to simulate user activity
+- Helps reduce inactivity-based session expiration
+- Cannot prevent server-side maximum session lifetime expiration
 
 ## Logging
 

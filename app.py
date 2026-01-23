@@ -31,12 +31,13 @@ except ImportError:
     logger.warning("Could not import config. Using default settings.")
 
 # Initialize scraper instance (reused across requests)
-# Keep-alive is enabled by default (runs every 5 minutes)
+# Keep-alive is enabled by default (runs every 3 minutes to prevent inactivity expiration)
 # Cookie expiration extended to 70 years (2096) by default
+# Note: More frequent keep-alive helps prevent server-side inactivity expiration
 scraper = VinnustundScraper(
     cookies=cookies, 
     headers=headers, 
-    keep_alive_interval=300, 
+    keep_alive_interval=180,  # 3 minutes - more frequent to prevent inactivity expiration
     enable_keep_alive=True,
     cookie_expiration_years=70  # Extend cookies to ~2096
 )
@@ -148,12 +149,23 @@ def cookie_info():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    with scraper._lock:
+        last_success = scraper.last_successful_request
+        consecutive_failures = scraper.consecutive_failures
+        time_since_success = (datetime.now() - last_success).total_seconds() if last_success else 0
+    
     return jsonify({
         'status': 'healthy',
         'keep_alive_enabled': scraper.enable_keep_alive,
         'keep_alive_interval': scraper.keep_alive_interval,
         'keep_alive_running': scraper.keep_alive_running if hasattr(scraper, 'keep_alive_running') else False,
-        'cookie_expiration_years': scraper.cookie_expiration_years
+        'cookie_expiration_years': scraper.cookie_expiration_years,
+        'session_status': {
+            'last_successful_request': last_success.isoformat() if last_success else None,
+            'hours_since_last_success': round(time_since_success / 3600, 2),
+            'consecutive_failures': consecutive_failures,
+            'warning': consecutive_failures >= 3 or time_since_success > 3600 * 24  # Warn if failures or >24h
+        }
     })
 
 if __name__ == '__main__':

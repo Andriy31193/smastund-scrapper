@@ -2,11 +2,13 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable, Any
 import random
 import threading
 from datetime import datetime, timedelta
 from http.cookiejar import Cookie
+from requests.exceptions import ConnectionError, Timeout, RequestException
+from urllib3.exceptions import ProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,28 @@ class VinnustundScraper:
             cookie_expiration_years: Number of years to extend cookie expiration (default: 70 = ~2096)
         """
         self.session = requests.Session()
+        
+        # Configure connection pooling and retries
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # Create retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        
+        # Mount adapter with retry strategy
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
         self.keep_alive_interval = keep_alive_interval
         self.enable_keep_alive = enable_keep_alive
         self.cookie_expiration_years = cookie_expiration_years
@@ -168,6 +192,55 @@ class VinnustundScraper:
         delay = random.uniform(min_seconds, max_seconds)
         time.sleep(delay)
     
+    def _retry_request(self, request_func: Callable, max_retries: int = 3, 
+                      base_delay: float = 1.0, max_delay: float = 10.0,
+                      retryable_exceptions: tuple = (ConnectionError, Timeout, ProtocolError, RequestException)) -> Any:
+        """
+        Retry a request function with exponential backoff on connection errors.
+        
+        Args:
+            request_func: Function that performs the request (should return response)
+            max_retries: Maximum number of retry attempts (default: 3)
+            base_delay: Base delay in seconds for exponential backoff (default: 1.0)
+            max_delay: Maximum delay in seconds (default: 10.0)
+            retryable_exceptions: Tuple of exceptions that should trigger retry
+        
+        Returns:
+            Response from request_func
+        
+        Raises:
+            Exception: If all retries fail
+        """
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return request_func()
+                
+            except retryable_exceptions as e:
+                last_exception = e
+                
+                if attempt < max_retries:
+                    # Calculate exponential backoff with jitter
+                    delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+                    logger.warning(
+                        f"Connection error on attempt {attempt + 1}/{max_retries + 1}: {type(e).__name__}. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(f"All {max_retries + 1} retry attempts failed")
+                    raise Exception(f"Connection failed after {max_retries + 1} attempts: {str(e)}")
+            
+            except Exception as e:
+                # Non-retryable exceptions - raise immediately
+                logger.error(f"Non-retryable error: {type(e).__name__}: {str(e)}")
+                raise
+        
+        # Should never reach here, but just in case
+        if last_exception:
+            raise Exception(f"Request failed: {str(last_exception)}")
+    
     def _check_session_valid(self, response: requests.Response) -> bool:
         """Check if session is still valid based on response"""
         logger.debug(f"Checking session validity - Status: {response.status_code}, URL: {response.url}")
@@ -228,7 +301,12 @@ class VinnustundScraper:
             
             with self._lock:
                 self.session.headers['Referer'] = self.BASE_URL
-                response = self.session.get(url, timeout=15)
+                
+                def get_url():
+                    return self.session.get(url, timeout=15)
+                
+                # Use retry logic for keep-alive requests
+                response = self._retry_request(get_url, max_retries=2, base_delay=0.5)
                 # Extend cookie expiration after each request to keep session alive
                 self._extend_cookie_expiration(self.cookie_expiration_years)
                 self.last_activity = datetime.now()
@@ -297,24 +375,28 @@ class VinnustundScraper:
         """
         try:
             with self._lock:
-                # Quick check - visit the main page
-                response = self.session.get(
-                    self.TIMESHEET_URL + "?sj=true",
-                    timeout=15
-                )
+                # Quick check - visit the main page with retry
+                def get_timesheet():
+                    return self.session.get(
+                        self.TIMESHEET_URL + "?sj=true",
+                        timeout=15
+                    )
+                
+                response = self._retry_request(get_timesheet, max_retries=2, base_delay=0.5)
                 # Extend cookie expiration
                 self._extend_cookie_expiration(self.cookie_expiration_years)
                 
                 if not self._check_session_valid(response):
                     logger.warning("Session appears invalid, attempting refresh...")
                     # Try to refresh by visiting base URL first
-                    self.session.get(self.BASE_URL, timeout=10)
+                    def get_base():
+                        return self.session.get(self.BASE_URL, timeout=10)
+                    
+                    self._retry_request(get_base, max_retries=2, base_delay=0.5)
                     time.sleep(1)
+                    
                     # Then try timesheet again
-                    response = self.session.get(
-                        self.TIMESHEET_URL + "?sj=true",
-                        timeout=15
-                    )
+                    response = self._retry_request(get_timesheet, max_retries=2, base_delay=0.5)
                     # Extend cookie expiration after refresh
                     self._extend_cookie_expiration(self.cookie_expiration_years)
                     
@@ -362,10 +444,15 @@ class VinnustundScraper:
                 self.last_activity = datetime.now()
             
             self.session.headers['Referer'] = self.BASE_URL
-            initial_response = self.session.get(
-                self.TIMESHEET_URL + "?sj=true",
-                timeout=30
-            )
+            
+            def get_initial_page():
+                return self.session.get(
+                    self.TIMESHEET_URL + "?sj=true",
+                    timeout=30
+                )
+            
+            # Use retry logic for initial GET
+            initial_response = self._retry_request(get_initial_page, max_retries=3, base_delay=1.0)
             
             logger.info(f"Initial GET - Status: {initial_response.status_code}, URL: {initial_response.url}")
             logger.debug(f"Response length: {len(initial_response.text)} bytes")
@@ -388,13 +475,20 @@ class VinnustundScraper:
                 # Try to refresh session by visiting base URL and then retrying
                 try:
                     with self._lock:
-                        self.session.get(self.BASE_URL, timeout=10)
+                        def get_base_refresh():
+                            return self.session.get(self.BASE_URL, timeout=10)
+                        
+                        self._retry_request(get_base_refresh, max_retries=2, base_delay=0.5)
                         time.sleep(2)
                         self._add_delay(1.0, 2.0)
-                        retry_response = self.session.get(
-                            self.TIMESHEET_URL + "?sj=true",
-                            timeout=30
-                        )
+                        
+                        def get_retry_page():
+                            return self.session.get(
+                                self.TIMESHEET_URL + "?sj=true",
+                                timeout=30
+                            )
+                        
+                        retry_response = self._retry_request(get_retry_page, max_retries=3, base_delay=1.0)
                         # Extend cookie expiration after refresh
                         self._extend_cookie_expiration(self.cookie_expiration_years)
                         self.last_activity = datetime.now()
@@ -450,12 +544,16 @@ class VinnustundScraper:
                 self.session.headers['Referer'] = self.TIMESHEET_URL + "?sj=true"
                 self.session.headers['Content-Type'] = 'application/x-www-form-urlencoded'
                 
-                response = self.session.post(
-                    self.TIMESHEET_URL,
-                    data=form_data,
-                    allow_redirects=True,
-                    timeout=30
-                )
+                def post_form():
+                    return self.session.post(
+                        self.TIMESHEET_URL,
+                        data=form_data,
+                        allow_redirects=True,
+                        timeout=30
+                    )
+                
+                # Use retry logic for POST request
+                response = self._retry_request(post_form, max_retries=3, base_delay=1.0)
                 # Extend cookie expiration after POST request
                 self._extend_cookie_expiration(self.cookie_expiration_years)
                 self.last_activity = datetime.now()
@@ -788,10 +886,15 @@ class VinnustundScraper:
         
         try:
             self._add_delay(0.5, 1.0)
-            response = self.session.get(
-                self.TIMESHEET_URL + "?sj=true",
-                timeout=15
-            )
+            
+            def get_auth_test():
+                return self.session.get(
+                    self.TIMESHEET_URL + "?sj=true",
+                    timeout=15
+                )
+            
+            # Use retry logic for auth test
+            response = self._retry_request(get_auth_test, max_retries=2, base_delay=0.5)
             
             logger.info(f"Auth test - Status: {response.status_code}, URL: {response.url}")
             

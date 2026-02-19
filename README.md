@@ -4,11 +4,11 @@ A Flask-based web scraper for retrieving shift data from kopavogur.vinnustund.is
 
 ## Features
 
-- Session management with cookie persistence
-- Browser-like headers to avoid bot detection
-- Random delays to simulate human behavior
-- Automatic session validation
-- RESTful API endpoint for retrieving shifts
+- **Login-based session**: Uses username/password from config to log in; no manual cookie copying.
+- **Automatic relogin**: When a request hits an expired session, the scraper relogins and retries once.
+- **Optional scheduled refresh**: Can relogin every X hours in the background (`REFRESH_AUTOMATICALLY`).
+- Browser-like headers and random delays to avoid bot detection.
+- RESTful API endpoint for retrieving shifts.
 
 ## Setup
 
@@ -17,18 +17,12 @@ A Flask-based web scraper for retrieving shift data from kopavogur.vinnustund.is
 pip install -r requirements.txt
 ```
 
-2. Configure cookies:
+2. Configure credentials:
    - Copy `config_example.py` to `config.py`
-   - Open your browser and log into kopavogur.vinnustund.is
-   - Open DevTools (F12) > Application/Storage > Cookies
-   - Copy all cookies from the site and paste them into `config.py`
-   - Or use a browser extension like "EditThisCookie" to export cookies
+   - Set `USERNAME` and `PASSWORD` (your Notendanafn and Lykilorð for kopavogur.vinnustund.is)
+   - Optionally set `REFRESH_AUTOMATICALLY` and `AUTOMATIC_REFRESH_PERIOD_HOURS` (see below)
 
-3. Update `app.py` to load cookies from config (optional):
-```python
-from config import COOKIES, CUSTOM_HEADERS
-scraper = VinnustundScraper(cookies=COOKIES, headers=CUSTOM_HEADERS)
-```
+Session cookies (JSESSIONID, sessionPersist, TS01780571) are obtained and updated automatically after each login; no manual cookie configuration is needed.
 
 ## Usage
 
@@ -115,52 +109,18 @@ Test if the current session is authenticated.
 
 Health check endpoint.
 
-## Session Management
+## Session management and refresh
 
-The scraper automatically:
-- Maintains session cookies across requests
-- Validates session before each request
-- Adds random delays (1-3 seconds) to simulate human behavior
-- Uses browser-like headers to avoid detection
-- Background keep-alive thread (runs every 5 minutes by default)
-- Automatic retry logic for connection errors
-- Cookie expiration extension (extends to ~2096)
+- **Login**: Session is obtained by POSTing username/password to the site’s login page. Cookies `JSESSIONID`, `sessionPersist`, and `TS01780571` are updated from the response.
+- **On request**: If a work-schedule request is made and the current session is expired, the scraper relogins, then retries the request once before returning.
+- **Config options** (in `config.py`):
+  - **`REFRESH_AUTOMATICALLY`** (bool): If `True`, a background thread relogins every `AUTOMATIC_REFRESH_PERIOD_HOURS`. If `False`, relogin only when a request is made and the session is expired.
+  - **`AUTOMATIC_REFRESH_PERIOD_HOURS`** (float): Used only when `REFRESH_AUTOMATICALLY` is `True`; period in hours between automatic relogins.
 
-### Important: Server-Side Session Expiration
+### Keep-alive
 
-**Server-side session expiration cannot be overridden by client-side cookie manipulation.**
-
-The server maintains its own session state and may expire sessions:
-- After a period of inactivity (e.g., 24 hours)
-- After a fixed maximum lifetime (e.g., 30 days)
-- Based on server-side policies
-
-**What we can do:**
-- ✅ Extend cookie expiration dates (prevents cookie expiration)
-- ✅ Keep session active with periodic requests (reduces inactivity expiration)
-- ✅ Automatically retry on connection errors
-- ❌ Cannot prevent server-side session expiration
-
-**What you need to do:**
-- Periodically refresh cookies by logging into the website
-- Update `config.py` with fresh cookies when sessions expire
-- The keep-alive mechanism helps but may not prevent all server-side expirations
-
-### Updating Cookies
-
-If you get a "Session expired" error (especially "server-side expiration"):
-1. Log into the website in your browser
-2. Extract fresh cookies using DevTools or EditThisCookie extension
-3. Update `config.py` with new cookies
-4. Restart the Flask server (or cookies will be updated on next request)
-
-### Keep-Alive
-
-The scraper includes automatic background keep-alive:
-- Runs every 5 minutes (configurable)
-- Visits random pages to simulate user activity
-- Helps reduce inactivity-based session expiration
-- Cannot prevent server-side maximum session lifetime expiration
+- Optional background keep-alive thread (e.g. every 3 minutes) can be enabled to hit the site periodically.
+- Relogin (on demand or on schedule) is the main way to refresh the session; keep-alive only helps reduce inactivity-based expiry.
 
 ## Logging
 
@@ -193,10 +153,10 @@ If you get empty shifts, check the logs for:
 
 ## Notes
 
-- The scraper mimics browser behavior to avoid detection
-- Cookies must be kept up to date for the session to work
-- Date format must be `dd.MM.yyyy` (e.g., "01.01.2026")
-- The scraper automatically handles form submission and table parsing
+- The scraper mimics browser behavior to avoid detection.
+- Set `USERNAME` and `PASSWORD` in `config.py`; session is refreshed via login (on expiry or on schedule).
+- Date format must be `dd.MM.yyyy` (e.g., "01.01.2026").
+- The scraper automatically handles login, form submission, and table parsing.
 
 ## Legal Notice
 

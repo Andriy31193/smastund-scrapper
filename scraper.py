@@ -15,41 +15,55 @@ logger = logging.getLogger(__name__)
 class VinnustundScraper:
     """
     Scraper for kopavogur.vinnustund.is attendance system.
-    Handles session management, cookie persistence, and bot detection avoidance.
+    Handles session management via login (username/password) and optional automatic refresh.
     """
     
     BASE_URL = "https://kopavogur.vinnustund.is"
     TIMESHEET_URL = f"{BASE_URL}/VS_MX/starfsmadur/starfsm_timafaerslur_view.jsp"
+    LOGIN_URL = f"{BASE_URL}/VS_MX/VSLoginX.jsp"
+    BUSINESS_GROUP = "97"
     
-    def __init__(self, cookies: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None, 
+    # Session cookie names updated after successful login
+    SESSION_COOKIE_NAMES = ("JSESSIONID", "sessionPersist", "TS01780571")
+    
+    def __init__(self, username: Optional[str] = None, password: Optional[str] = None,
+                 headers: Optional[Dict[str, str]] = None,
                  keep_alive_interval: int = 180, enable_keep_alive: bool = True,
-                 cookie_expiration_years: int = 70):
+                 cookie_expiration_years: int = 70,
+                 refresh_automatically: bool = False,
+                 automatic_refresh_period_hours: float = 8):
         """
-        Initialize the scraper with session management.
+        Initialize the scraper with optional credentials for login-based session.
         
         Args:
-            cookies: Dictionary of cookies to use (if None, will need to be set manually)
+            username: Login username (notandanafn)
+            password: Login password (lykilord)
             headers: Custom headers (if None, uses default browser-like headers)
-            keep_alive_interval: Interval in seconds between keep-alive actions (default: 180 = 3 minutes)
-                                 More frequent keep-alive helps prevent server-side inactivity expiration
+            keep_alive_interval: Interval in seconds between keep-alive actions (default: 180)
             enable_keep_alive: Whether to enable background keep-alive thread (default: True)
-            cookie_expiration_years: Number of years to extend cookie expiration (default: 70 = ~2096)
+            cookie_expiration_years: Number of years to extend cookie expiration (default: 70)
+            refresh_automatically: If True, relogin every automatic_refresh_period_hours
+            automatic_refresh_period_hours: Hours between automatic relogin (only if refresh_automatically)
         """
         self.session = requests.Session()
+        self._username = username
+        self._password = password
+        self.refresh_automatically = refresh_automatically
+        self.automatic_refresh_period_hours = automatic_refresh_period_hours
+        self._last_login_at: Optional[datetime] = None
+        self._refresh_thread = None
+        self._refresh_running = False
         
         # Configure connection pooling and retries
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
         
-        # Create retry strategy
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"]
         )
-        
-        # Mount adapter with retry strategy
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
             pool_connections=10,
@@ -68,7 +82,6 @@ class VinnustundScraper:
         self.consecutive_failures = 0
         self._lock = threading.Lock()
         
-        # Set default browser-like headers
         self.default_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -81,23 +94,19 @@ class VinnustundScraper:
             'Sec-Fetch-Site': 'none',
             'Cache-Control': 'max-age=0',
         }
-        
         if headers:
             self.default_headers.update(headers)
-        
         self.session.headers.update(self.default_headers)
         
-        # Set cookies if provided
-        if cookies:
-            self.session.cookies.update(cookies)
-            self._extend_cookie_expiration(self.cookie_expiration_years)
-            logger.info(f"✓ Cookies loaded into session: {len(cookies)} cookies")
+        if username and password:
+            logger.info("✓ Credentials configured - session will be obtained via login")
         else:
-            logger.warning("⚠ No cookies provided - session may not be authenticated")
+            logger.warning("⚠ No username/password - login and session refresh unavailable")
         
-        # Start keep-alive thread if enabled
         if self.enable_keep_alive:
             self.start_keep_alive()
+        if self.refresh_automatically and username and password:
+            self._start_automatic_refresh()
     
     def _extend_cookie_expiration(self, expiration_years: int = 70):
         """
@@ -147,6 +156,116 @@ class VinnustundScraper:
                 logger.debug(f"Extended expiration for {extended_count} cookie(s) to {expiration_years} years in the future")
         except Exception as e:
             logger.warning(f"Error extending cookie expiration: {str(e)}")
+    
+    def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
+        """
+        Log in and obtain a new session. Updates JSESSIONID, sessionPersist, TS01780571 from response.
+        Uses instance username/password if arguments not provided.
+        
+        Returns:
+            True if login succeeded (session has valid cookies), False otherwise.
+        """
+        u = username or self._username
+        p = password or self._password
+        if not u or not p:
+            logger.error("Login failed: no username or password provided")
+            return False
+        
+        try:
+            # Clear existing session cookies so we get a fresh session
+            self.session.cookies.clear()
+            self.session.headers["Referer"] = self.BASE_URL
+            
+            # Step 1: GET login page to obtain form (including "random" hidden field)
+            login_get_url = f"{self.LOGIN_URL}?businessgroup={self.BUSINESS_GROUP}"
+            self._add_delay(0.5, 1.5)
+            get_resp = self.session.get(login_get_url, timeout=15)
+            get_resp.raise_for_status()
+            
+            soup = BeautifulSoup(get_resp.text, "html.parser")
+            form = soup.find("form", {"name": "search_form"}) or soup.find("form", action=lambda a: a and "VSLoginX" in a)
+            if not form:
+                logger.error("Login failed: could not find login form on page")
+                return False
+            
+            hidden = {}
+            for inp in form.find_all("input", type="hidden"):
+                name = inp.get("name")
+                if name:
+                    hidden[name] = inp.get("value", "")
+            
+            # Build POST data: hidden fields + credentials
+            # Field names from reference: notandanafn, lykilord; action=search, businessgroup=97
+            post_data = {
+                "action": "search",
+                "businessgroup": self.BUSINESS_GROUP,
+                "notandanafn": u,
+                "lykilord": p,
+            }
+            post_data.update(hidden)
+            
+            # Step 2: POST login
+            self._add_delay(0.5, 1.5)
+            self.session.headers["Referer"] = login_get_url
+            self.session.headers["Content-Type"] = "application/x-www-form-urlencoded"
+            post_resp = self.session.post(
+                self.LOGIN_URL,
+                data=post_data,
+                allow_redirects=True,
+                timeout=15,
+            )
+            post_resp.raise_for_status()
+            
+            # Check we are not still on login page
+            if "VSLoginX" in post_resp.url or "login" in post_resp.url.lower():
+                logger.error("Login failed: still on login page after POST")
+                return False
+            if "notandanafn" in post_resp.text and "lykilord" in post_resp.text and "search_form" in post_resp.text:
+                logger.error("Login failed: login form still present in response")
+                return False
+            
+            # Ensure we have session cookies (JSESSIONID, sessionPersist, TS01780571)
+            cookie_names = {c.name for c in self.session.cookies}
+            for name in self.SESSION_COOKIE_NAMES:
+                if name not in cookie_names:
+                    logger.warning(f"Login: expected cookie '{name}' not in session (have: {cookie_names})")
+            
+            self._extend_cookie_expiration(self.cookie_expiration_years)
+            with self._lock:
+                self._last_login_at = datetime.now()
+                self.last_successful_request = datetime.now()
+                self.consecutive_failures = 0
+            logger.info("✓ Login successful; session cookies updated")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Login failed: {e}", exc_info=True)
+            return False
+    
+    def _start_automatic_refresh(self):
+        """Start background thread that relogins every automatic_refresh_period_hours."""
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            return
+        self._refresh_running = True
+        self._refresh_thread = threading.Thread(target=self._automatic_refresh_worker, daemon=True)
+        self._refresh_thread.start()
+        logger.info(f"Automatic refresh thread started (every {self.automatic_refresh_period_hours} hours)")
+    
+    def _automatic_refresh_worker(self):
+        interval_seconds = max(60, self.automatic_refresh_period_hours * 3600)
+        while self._refresh_running:
+            time.sleep(interval_seconds)
+            if not self._refresh_running:
+                break
+            if not (self._username and self._password):
+                continue
+            logger.info("Performing scheduled automatic relogin...")
+            self.login()
+    
+    def _stop_automatic_refresh(self):
+        self._refresh_running = False
+        if self._refresh_thread:
+            self._refresh_thread.join(timeout=5)
     
     def set_cookies(self, cookies: Dict[str, str]):
         """Update cookies in the session and extend their expiration"""
@@ -409,33 +528,31 @@ class VinnustundScraper:
     def _ensure_session_valid(self) -> bool:
         """
         Ensure session is valid before making requests.
-        Performs a quick check and refresh if needed.
-        Note: This is a lightweight check - actual validation happens during the request.
+        If we have no cookies but have credentials, attempt login.
         """
         try:
-            # Quick check without lock to avoid blocking
-            # Just verify we have cookies and update timestamps
-            if len(self.session.cookies) == 0:
-                logger.warning("No cookies in session")
-                return False
-            
             with self._lock:
                 self.last_activity = datetime.now()
-                # Don't reset failures here - let actual requests do that
-            
+            if len(self.session.cookies) == 0 and self._username and self._password:
+                logger.info("No session cookies; performing login...")
+                return self.login()
+            if len(self.session.cookies) == 0:
+                logger.warning("No cookies in session and no credentials to login")
+                return False
             return True
-                
         except Exception as e:
             logger.error(f"Error ensuring session validity: {str(e)}")
             return False
     
-    def get_shifts(self, date_from: str, date_to: str) -> List[Dict]:
+    def get_shifts(self, date_from: str, date_to: str, _retry_after_login: bool = False) -> List[Dict]:
         """
         Retrieve shifts for the given date range.
+        If session is expired and credentials are configured, relogin and retry once.
         
         Args:
             date_from: Start date in format dd.MM.yyyy (e.g., "01.01.2026")
             date_to: End date in format dd.MM.yyyy (e.g., "25.01.2026")
+            _retry_after_login: Internal flag to avoid infinite recursion on retry
         
         Returns:
             List of dictionaries containing shift information
@@ -444,15 +561,12 @@ class VinnustundScraper:
         logger.info(f"Fetching shifts from {date_from} to {date_to}")
         logger.info("=" * 60)
         
-        # Log current session state
         logger.info(f"Current cookies in session: {len(self.session.cookies)} cookies")
         
-            # Ensure session is valid before proceeding
         if not self._ensure_session_valid():
             raise Exception(
-                "Session expired or invalid (likely server-side expiration). "
-                "Server-side sessions cannot be extended by client-side cookie manipulation. "
-                "Please log into the website and update cookies in config.py"
+                "Session invalid and login not available or failed. "
+                "Configure USERNAME and PASSWORD in config.py for automatic relogin."
             )
         
         try:
@@ -479,9 +593,13 @@ class VinnustundScraper:
             logger.info(f"Initial GET - Status: {initial_response.status_code}, URL: {initial_response.url}")
             logger.debug(f"Response length: {len(initial_response.text)} bytes")
             
-            # Check session validity
+            # Check session validity; relogin and retry once if we have credentials
             if not self._check_session_valid(initial_response):
-                raise Exception("Session expired or invalid. Please update cookies.")
+                if not _retry_after_login and self._username and self._password:
+                    logger.info("Session expired; relogin and retrying once...")
+                    if self.login():
+                        return self.get_shifts(date_from, date_to, _retry_after_login=True)
+                raise Exception("Session expired or invalid. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
             
             if initial_response.status_code != 200:
                 raise Exception(f"Initial GET failed with status code {initial_response.status_code}")
@@ -587,10 +705,13 @@ class VinnustundScraper:
             logger.info(f"POST response - Status: {response.status_code}, URL: {response.url}")
             logger.debug(f"Response length: {len(response.text)} bytes")
             
-            # Check if session is still valid
             if not self._check_session_valid(response):
                 logger.error("✗ Session validation failed after POST")
-                raise Exception("Session expired or invalid. Please update cookies.")
+                if not _retry_after_login and self._username and self._password:
+                    logger.info("Session expired; relogin and retrying once...")
+                    if self.login():
+                        return self.get_shifts(date_from, date_to, _retry_after_login=True)
+                raise Exception("Session expired or invalid. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
             
             if response.status_code != 200:
                 logger.error(f"✗ POST failed with status code {response.status_code}")
@@ -684,12 +805,14 @@ class VinnustundScraper:
             raise Exception(f"Failed to retrieve shifts: {str(e)}")
         except Exception as e:
             error_msg = str(e)
-            # Check if this might be a server-side session expiration
+            # On session-related errors, try relogin once if we have credentials
+            if not _retry_after_login and self._username and self._password:
+                if 'Session expired' in error_msg or 'Session may be invalid' in error_msg or 'Could not find form' in error_msg or 'invalid' in error_msg.lower():
+                    logger.info("Session-related error; relogin and retrying once...")
+                    if self.login():
+                        return self.get_shifts(date_from, date_to, _retry_after_login=True)
             if 'Session expired' in error_msg or 'Session may be invalid' in error_msg or 'Could not find form' in error_msg:
-                logger.error("⚠ Server-side session expiration detected")
-                logger.error("   Server-side sessions cannot be extended by client-side cookie manipulation.")
-                logger.error("   The server may expire sessions after inactivity or a fixed lifetime.")
-                logger.error("   Solution: Update cookies by logging into the website and extracting fresh cookies.")
+                logger.error("⚠ Session expiration detected. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
             logger.error(f"✗ Error: {error_msg}")
             raise
     
@@ -960,3 +1083,4 @@ class VinnustundScraper:
     def __del__(self):
         """Cleanup when object is destroyed"""
         self.stop_keep_alive()
+        self._stop_automatic_refresh()

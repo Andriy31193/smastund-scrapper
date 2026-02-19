@@ -1,25 +1,21 @@
 """
-Example configuration file for cookies and headers.
-Copy this to config.py and update with your actual cookies.
+Example configuration file.
+Copy this to config.py and update with your credentials and settings.
 """
 
-# Cookies from your browser session
-# To get these:
-# 1. Open browser DevTools (F12)
-# 2. Go to Application/Storage > Cookies
-# 3. Copy all cookies from kopavogur.vinnustund.is
-# 4. Or use a browser extension like EditThisCookie
+# Login credentials (used for automatic relogin when session expires)
+USERNAME = "your_username"
+PASSWORD = "your_password"
 
-COOKIES = {
-    'bgid': '97',
-    'JSESSIONID': 'YOUR_SESSION_ID_HERE',
-    'sessionPersist': 'YOUR_SESSION_PERSIST_HERE',
-    'TS01780571': 'YOUR_TS_TOKEN_HERE',
-    # Add any other cookies you see in your browser
-}
+# Session refresh behavior
+# If True: relogin automatically every Automatic_Refresh_Period hours
+# If False: relogin only when a request is made and the current session is expired
+REFRESH_AUTOMATICALLY = False
+
+# How often to perform automatic relogin (in hours). Only used when REFRESH_AUTOMATICALLY is True.
+AUTOMATIC_REFRESH_PERIOD_HOURS = 8
 
 # Optional: Custom headers (usually default headers work fine)
 CUSTOM_HEADERS = {
-    'Referer': 'https://kopavogur.vinnustund.is/',
-    # Add any other custom headers if needed
+    "Referer": "https://kopavogur.vinnustund.is/",
 }

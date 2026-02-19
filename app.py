@@ -16,36 +16,53 @@ logger = logging.getLogger(__name__)
 logging.getLogger('requests').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-# Try to load cookies from config if available
-cookies = None
+# Load config: credentials and session refresh settings (cookies are obtained via login)
+username = None
+password = None
 headers = None
+refresh_automatically = False
+automatic_refresh_period_hours = 8
 try:
-    if os.path.exists('config.py'):
-        from config import COOKIES, CUSTOM_HEADERS
-        cookies = COOKIES
+    if os.path.exists("config.py"):
+        from config import (
+            USERNAME,
+            PASSWORD,
+            CUSTOM_HEADERS,
+            REFRESH_AUTOMATICALLY,
+            AUTOMATIC_REFRESH_PERIOD_HOURS,
+        )
+        username = USERNAME
+        password = PASSWORD
         headers = CUSTOM_HEADERS
-        logger.info("Loaded cookies and headers from config.py")
+        refresh_automatically = REFRESH_AUTOMATICALLY
+        automatic_refresh_period_hours = float(AUTOMATIC_REFRESH_PERIOD_HOURS)
+        logger.info(
+            "Loaded config: credentials and refresh_automatically=%s, automatic_refresh_period_hours=%s",
+            refresh_automatically,
+            automatic_refresh_period_hours,
+        )
     else:
-        logger.warning("config.py not found. You'll need to set cookies manually using scraper.set_cookies()")
-except ImportError:
-    logger.warning("Could not import config. Using default settings.")
+        logger.warning("config.py not found. Set USERNAME/PASSWORD for login.")
+except ImportError as e:
+    logger.warning("Could not import config: %s. Using default settings.", e)
 
-# Initialize scraper instance (reused across requests)
-# Keep-alive is enabled by default (runs every 3 minutes to prevent inactivity expiration)
-# Cookie expiration extended to 70 years (2096) by default
-# Note: More frequent keep-alive helps prevent server-side inactivity expiration
+# Initialize scraper (session is obtained via login; relogin on expiry or on schedule)
 scraper = VinnustundScraper(
-    cookies=cookies, 
-    headers=headers, 
-    keep_alive_interval=180,  # 3 minutes - more frequent to prevent inactivity expiration
+    username=username,
+    password=password,
+    headers=headers,
+    keep_alive_interval=180,
     enable_keep_alive=True,
-    cookie_expiration_years=70  # Extend cookies to ~2096
+    cookie_expiration_years=70,
+    refresh_automatically=refresh_automatically,
+    automatic_refresh_period_hours=automatic_refresh_period_hours,
 )
 
-# Register cleanup function to stop keep-alive thread on shutdown
+
 def cleanup():
-    logger.info("Shutting down, stopping keep-alive thread...")
+    logger.info("Shutting down, stopping keep-alive and refresh threads...")
     scraper.stop_keep_alive()
+    scraper._stop_automatic_refresh()
 
 atexit.register(cleanup)
 
@@ -104,7 +121,7 @@ def test_auth():
         return jsonify({
             'success': auth_success,
             'authenticated': auth_success,
-            'message': 'Authentication successful' if auth_success else 'Authentication failed - check cookies'
+            'message': 'Authentication successful' if auth_success else 'Authentication failed - check credentials or run relogin'
         })
     except Exception as e:
         logger.error(f"Error testing auth: {str(e)}", exc_info=True)
@@ -113,6 +130,20 @@ def test_auth():
             'authenticated': False,
             'error': str(e)
         }), 500
+
+@app.route("/login", methods=["POST", "GET"])
+def trigger_login():
+    """Manually trigger relogin to refresh session (JSESSIONID, sessionPersist, TS01780571)."""
+    try:
+        success = scraper.login()
+        return jsonify({
+            "success": success,
+            "message": "Login successful; session cookies updated" if success else "Login failed - check USERNAME/PASSWORD in config",
+        })
+    except Exception as e:
+        logger.error(f"Error during login: {str(e)}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/keep_alive', methods=['POST', 'GET'])
 def trigger_keep_alive():
@@ -154,17 +185,21 @@ def health():
         consecutive_failures = scraper.consecutive_failures
         time_since_success = (datetime.now() - last_success).total_seconds() if last_success else 0
     
+    last_login = getattr(scraper, "_last_login_at", None)
     return jsonify({
         'status': 'healthy',
         'keep_alive_enabled': scraper.enable_keep_alive,
         'keep_alive_interval': scraper.keep_alive_interval,
-        'keep_alive_running': scraper.keep_alive_running if hasattr(scraper, 'keep_alive_running') else False,
+        'keep_alive_running': getattr(scraper, 'keep_alive_running', False),
+        'refresh_automatically': getattr(scraper, 'refresh_automatically', False),
+        'automatic_refresh_period_hours': getattr(scraper, 'automatic_refresh_period_hours', None),
         'cookie_expiration_years': scraper.cookie_expiration_years,
         'session_status': {
             'last_successful_request': last_success.isoformat() if last_success else None,
+            'last_login_at': last_login.isoformat() if last_login else None,
             'hours_since_last_success': round(time_since_success / 3600, 2),
             'consecutive_failures': consecutive_failures,
-            'warning': consecutive_failures >= 3 or time_since_success > 3600 * 24  # Warn if failures or >24h
+            'warning': consecutive_failures >= 3 or time_since_success > 3600 * 24
         }
     })
 

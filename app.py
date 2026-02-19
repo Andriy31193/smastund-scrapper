@@ -6,10 +6,9 @@ import atexit
 from datetime import datetime
 
 app = Flask(__name__)
-# Set logging level to DEBUG for detailed output
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 # Set requests library to be less verbose
@@ -36,11 +35,8 @@ try:
         headers = CUSTOM_HEADERS
         refresh_automatically = REFRESH_AUTOMATICALLY
         automatic_refresh_period_hours = float(AUTOMATIC_REFRESH_PERIOD_HOURS)
-        logger.info(
-            "Loaded config: credentials and refresh_automatically=%s, automatic_refresh_period_hours=%s",
-            refresh_automatically,
-            automatic_refresh_period_hours,
-        )
+        if refresh_automatically:
+            logger.info("Config: automatic relogin every %.1f hours", automatic_refresh_period_hours)
     else:
         logger.warning("config.py not found. Set USERNAME/PASSWORD for login.")
 except ImportError as e:
@@ -60,7 +56,6 @@ scraper = VinnustundScraper(
 
 
 def cleanup():
-    logger.info("Shutting down, stopping keep-alive and refresh threads...")
     scraper.stop_keep_alive()
     scraper._stop_automatic_refresh()
 
@@ -93,9 +88,6 @@ def retrieve_shifts():
                 'message': 'Both dateFrom and dateTo are required (format: dd.MM.yyyy)'
             }), 400
         
-        logger.info(f"Retrieving shifts from {date_from} to {date_to}")
-        
-        # Scrape the shifts
         shifts = scraper.get_shifts(date_from, date_to)
         
         return jsonify({

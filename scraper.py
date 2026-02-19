@@ -98,10 +98,8 @@ class VinnustundScraper:
             self.default_headers.update(headers)
         self.session.headers.update(self.default_headers)
         
-        if username and password:
-            logger.info("✓ Credentials configured - session will be obtained via login")
-        else:
-            logger.warning("⚠ No username/password - login and session refresh unavailable")
+        if not (username and password):
+            logger.warning("No USERNAME/PASSWORD in config; login and session refresh disabled")
         
         if self.enable_keep_alive:
             self.start_keep_alive()
@@ -194,8 +192,7 @@ class VinnustundScraper:
                 if name:
                     hidden[name] = inp.get("value", "")
             
-            # Build POST data: hidden fields + credentials
-            # Field names from reference: notandanafn, lykilord; action=search, businessgroup=97
+            # Build POST data: hidden fields + credentials; include submit button if form has it
             post_data = {
                 "action": "search",
                 "businessgroup": self.BUSINESS_GROUP,
@@ -203,6 +200,8 @@ class VinnustundScraper:
                 "lykilord": p,
             }
             post_data.update(hidden)
+            if form.find("button", {"name": "leita"}) or form.find("input", {"name": "leita"}):
+                post_data["leita"] = "Innskrá"  # submit button value from reference page
             
             # Step 2: POST login
             self._add_delay(0.5, 1.5)
@@ -216,30 +215,40 @@ class VinnustundScraper:
             )
             post_resp.raise_for_status()
             
-            # Check we are not still on login page
-            if "VSLoginX" in post_resp.url or "login" in post_resp.url.lower():
-                logger.error("Login failed: still on login page after POST")
-                return False
-            if "notandanafn" in post_resp.text and "lykilord" in post_resp.text and "search_form" in post_resp.text:
-                logger.error("Login failed: login form still present in response")
-                return False
-            
-            # Ensure we have session cookies (JSESSIONID, sessionPersist, TS01780571)
             cookie_names = {c.name for c in self.session.cookies}
+            has_session_cookies = any(name in cookie_names for name in self.SESSION_COOKIE_NAMES)
+            # Response body contains the login form = login failed (wrong credentials or validation)
+            body_has_login_form = (
+                "notandanafn" in post_resp.text and "lykilord" in post_resp.text and "search_form" in post_resp.text
+            )
+            
+            if not has_session_cookies:
+                logger.error("Login failed: no session cookies (check USERNAME/PASSWORD)")
+                return False
+            if body_has_login_form:
+                logger.error("Login failed: wrong credentials (check USERNAME/PASSWORD)")
+                return False
+            try:
+                check_resp = self.session.get(self.TIMESHEET_URL + "?sj=true", timeout=10)
+                if not self._check_session_valid(check_resp):
+                    logger.error("Login failed: session not authenticated")
+                    return False
+            except Exception as check_e:
+                logger.debug("Login verify request failed: %s", check_e)
+            
             for name in self.SESSION_COOKIE_NAMES:
                 if name not in cookie_names:
-                    logger.warning(f"Login: expected cookie '{name}' not in session (have: {cookie_names})")
+                    logger.debug("Login: cookie %s not in session", name)
             
             self._extend_cookie_expiration(self.cookie_expiration_years)
             with self._lock:
                 self._last_login_at = datetime.now()
                 self.last_successful_request = datetime.now()
                 self.consecutive_failures = 0
-            logger.info("✓ Login successful; session cookies updated")
+            logger.info("Login successful")
             return True
-            
         except Exception as e:
-            logger.error(f"Login failed: {e}", exc_info=True)
+            logger.error("Login failed: %s", e)
             return False
     
     def _start_automatic_refresh(self):
@@ -249,8 +258,8 @@ class VinnustundScraper:
         self._refresh_running = True
         self._refresh_thread = threading.Thread(target=self._automatic_refresh_worker, daemon=True)
         self._refresh_thread.start()
-        logger.info(f"Automatic refresh thread started (every {self.automatic_refresh_period_hours} hours)")
-    
+        logger.info("Automatic refresh: relogin every %.1f hours", self.automatic_refresh_period_hours)
+
     def _automatic_refresh_worker(self):
         interval_seconds = max(60, self.automatic_refresh_period_hours * 3600)
         while self._refresh_running:
@@ -259,7 +268,7 @@ class VinnustundScraper:
                 break
             if not (self._username and self._password):
                 continue
-            logger.info("Performing scheduled automatic relogin...")
+            logger.info("Scheduled relogin (every %.1f h)", self.automatic_refresh_period_hours)
             self.login()
     
     def _stop_automatic_refresh(self):
@@ -376,45 +385,32 @@ class VinnustundScraper:
     
     def _check_session_valid(self, response: requests.Response) -> bool:
         """
-        Check if session is still valid based on response.
-        Note: Server-side session expiration cannot be overridden by client-side cookie manipulation.
-        The server may expire sessions after inactivity or a fixed lifetime regardless of cookie expiration.
+        Return False only when the response clearly indicates session expired (login redirect or login form).
+        Small responses or sessionError.jsp are not treated as expiry; only definitive login signals are.
         """
-        logger.debug(f"Checking session validity - Status: {response.status_code}, URL: {response.url}")
+        # Definitive: HTTP auth failure
+        if response.status_code in [401, 403]:
+            return False
         
-        # Check response size - very small responses (< 1000 bytes) often indicate redirects or errors
-        if len(response.text) < 1000:
-            logger.warning(f"⚠ Suspiciously small response: {len(response.text)} bytes - may indicate session expiration")
-            # Check if it's a redirect or error page
-            if 'login' in response.text.lower() or 'VSLogin' in response.text or len(response.text) < 500:
-                logger.error("✗ Session invalid: Response too small, likely expired (server-side expiration)")
+        # Definitive: redirected to login page URL
+        if "VSLoginX" in response.url or ("login" in response.url.lower() and "VSLogin" in response.url):
+            return False
+        
+        # Definitive: response body is the login form (not just a link)
+        text = response.text or ""
+        if ("notandanafn" in text or 'name="username"' in text) and ("lykilord" in text or 'name="password"' in text):
+            if "search_form" in text or "VSLogin" in text:
                 return False
         
-        # Check for redirects to login or error pages
-        if response.status_code in [401, 403]:
-            logger.error(f"✗ Session invalid: HTTP {response.status_code} (server-side expiration)")
-            return False
+        # sessionError.jsp is a generic error page (small response); do not treat as session expiry
+        if "sessionError" in response.url:
+            return True
         
-        # Check if redirected to login page
-        if 'login' in response.url.lower() or 'VSLogin' in response.url:
-            logger.error(f"✗ Session invalid: Redirected to login page (server-side expiration)")
-            return False
+        # Clear success: we got timesheet/app content
+        if "clsTableControl" in text or "detail_form" in text or "starfsm_timafaerslur_view" in response.url:
+            return True
         
-        # Check response content for login indicators
-        if response.text:
-            # Check for login page indicators
-            if 'VSLogin.jsp' in response.text or 'login.jsp' in response.text:
-                # But check if it's actually a login form, not just a link
-                if 'name="username"' in response.text or 'name="password"' in response.text:
-                    logger.error("✗ Session invalid: Login form detected in response (server-side expiration)")
-                    return False
-            
-            # Check for successful authentication indicators
-            if 'starfsm_timafaerslur_view.jsp' in response.url or 'clsTableControl' in response.text or 'detail_form' in response.text:
-                logger.info("✓ Session appears valid - found timesheet content")
-                return True
-        
-        logger.warning("⚠ Could not definitively determine session validity")
+        # Inconclusive (e.g. small non-login page): assume valid; actual shifts request will tell
         return True
     
     
@@ -454,57 +450,29 @@ class VinnustundScraper:
                 with self._lock:
                     self.last_successful_request = datetime.now()
                     self.consecutive_failures = 0
-                logger.debug(f"Keep-alive action successful: {url}")
                 return True
-            else:
-                with self._lock:
-                    self.consecutive_failures += 1
-                logger.warning(f"Keep-alive action detected session expiration (failures: {self.consecutive_failures})")
-                return False
-                
+            with self._lock:
+                self.consecutive_failures += 1
+            return False
         except Exception as e:
             with self._lock:
                 self.consecutive_failures += 1
-            logger.warning(f"Keep-alive action failed: {str(e)} (failures: {self.consecutive_failures})")
+            logger.debug("Keep-alive request failed: %s", e)
             return False
     
     def _keep_alive_worker(self):
-        """Background worker thread for keep-alive actions"""
-        logger.info(f"Keep-alive thread started (interval: {self.keep_alive_interval}s)")
-        
+        """Background worker thread for keep-alive actions."""
         while self.keep_alive_running:
             try:
-                # Wait for the interval
                 time.sleep(self.keep_alive_interval)
-                
                 if not self.keep_alive_running:
                     break
-                
-                # Check if we need to perform keep-alive
                 time_since_activity = (datetime.now() - self.last_activity).total_seconds()
-                
                 if time_since_activity >= self.keep_alive_interval:
-                    logger.debug("Performing scheduled keep-alive action...")
-                    success = self._perform_keep_alive_action()
-                    
-                    # If keep-alive fails multiple times, warn about potential expiration
-                    with self._lock:
-                        if self.consecutive_failures >= 3:
-                            time_since_success = (datetime.now() - self.last_successful_request).total_seconds()
-                            hours_since_success = time_since_success / 3600
-                            logger.warning(
-                                f"⚠ Multiple keep-alive failures ({self.consecutive_failures}). "
-                                f"Last successful request: {hours_since_success:.1f} hours ago. "
-                                f"Session may be expired - consider refreshing cookies."
-                            )
-                else:
-                    logger.debug(f"Skipping keep-alive (last activity {int(time_since_activity)}s ago)")
-                    
+                    self._perform_keep_alive_action()
             except Exception as e:
-                logger.error(f"Error in keep-alive worker: {str(e)}")
-                time.sleep(60)  # Wait a minute before retrying
-        
-        logger.info("Keep-alive thread stopped")
+                logger.debug("Keep-alive worker error: %s", e)
+                time.sleep(60)
     
     def start_keep_alive(self):
         """Start the background keep-alive thread"""
@@ -515,13 +483,11 @@ class VinnustundScraper:
             self.keep_alive_running = True
             self.keep_alive_thread = threading.Thread(target=self._keep_alive_worker, daemon=True)
             self.keep_alive_thread.start()
-            logger.info("Background keep-alive thread started")
     
     def stop_keep_alive(self):
         """Stop the background keep-alive thread"""
         if self.keep_alive_running:
             self.keep_alive_running = False
-            logger.info("Stopping keep-alive thread...")
             if self.keep_alive_thread:
                 self.keep_alive_thread.join(timeout=5)
     
@@ -534,7 +500,7 @@ class VinnustundScraper:
             with self._lock:
                 self.last_activity = datetime.now()
             if len(self.session.cookies) == 0 and self._username and self._password:
-                logger.info("No session cookies; performing login...")
+                logger.info("Logging in (no session)")
                 return self.login()
             if len(self.session.cookies) == 0:
                 logger.warning("No cookies in session and no credentials to login")
@@ -557,12 +523,6 @@ class VinnustundScraper:
         Returns:
             List of dictionaries containing shift information
         """
-        logger.info("=" * 60)
-        logger.info(f"Fetching shifts from {date_from} to {date_to}")
-        logger.info("=" * 60)
-        
-        logger.info(f"Current cookies in session: {len(self.session.cookies)} cookies")
-        
         if not self._ensure_session_valid():
             raise Exception(
                 "Session invalid and login not available or failed. "
@@ -570,8 +530,6 @@ class VinnustundScraper:
             )
         
         try:
-            # Step 1: First GET the page to get the form with all hidden fields
-            logger.info("Step 1: Fetching initial page to get form fields...")
             self._add_delay(1.0, 2.0)
             
             self.session.headers['Referer'] = self.BASE_URL
@@ -590,13 +548,9 @@ class VinnustundScraper:
                 self._extend_cookie_expiration(self.cookie_expiration_years)
                 self.last_activity = datetime.now()
             
-            logger.info(f"Initial GET - Status: {initial_response.status_code}, URL: {initial_response.url}")
-            logger.debug(f"Response length: {len(initial_response.text)} bytes")
-            
-            # Check session validity; relogin and retry once if we have credentials
             if not self._check_session_valid(initial_response):
                 if not _retry_after_login and self._username and self._password:
-                    logger.info("Session expired; relogin and retrying once...")
+                    logger.info("Session expired; relogin and retry")
                     if self.login():
                         return self.get_shifts(date_from, date_to, _retry_after_login=True)
                 raise Exception("Session expired or invalid. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
@@ -609,8 +563,7 @@ class VinnustundScraper:
             form = initial_soup.find('form', {'name': 'detail_form'})
             
             if not form:
-                logger.error("✗ Could not find detail_form on initial page")
-                logger.info("Attempting session refresh...")
+                logger.debug("detail_form not found on initial page; trying refresh")
                 
                 # Try to refresh session by visiting base URL and then retrying
                 try:
@@ -635,22 +588,16 @@ class VinnustundScraper:
                         self.last_activity = datetime.now()
                     
                     if not self._check_session_valid(retry_response):
-                        raise Exception("Session expired or invalid after refresh. Please update cookies.")
+                        raise Exception("Session expired or invalid after refresh.")
                     
                     initial_soup = BeautifulSoup(retry_response.text, 'html.parser')
                     form = initial_soup.find('form', {'name': 'detail_form'})
                     
                     if not form:
                         raise Exception("Could not find form on page even after refresh. Session may be invalid.")
-                    
-                    logger.info("✓ Session refreshed successfully, form found")
                     initial_response = retry_response
-                    
                 except Exception as refresh_error:
-                    logger.error(f"Session refresh failed: {str(refresh_error)}")
                     raise Exception("Could not find form on page. Session may be invalid.")
-            
-            logger.info("✓ Found detail_form")
             
             # Extract all hidden input fields from the form
             hidden_inputs = {}
@@ -660,10 +607,7 @@ class VinnustundScraper:
                 if name:
                     hidden_inputs[name] = value
             
-            logger.info(f"Extracted {len(hidden_inputs)} hidden form fields")
-            
-            # Step 2: Prepare form data with all hidden fields + our date range
-            logger.info("Step 2: Preparing form submission...")
+            # Prepare form data with all hidden fields + our date range
             form_data = hidden_inputs.copy()
             form_data.update({
                 'timabilFra': date_from,
@@ -676,9 +620,7 @@ class VinnustundScraper:
             if 'showBak' not in form_data:
                 form_data['showBak'] = 'true'
             
-            logger.info(f"Submitting form with {len(form_data)} fields")
-            
-            # Step 3: Submit the form
+            # Submit the form
             self._add_delay(1.0, 2.0)
             
             self.session.headers['Referer'] = self.TIMESHEET_URL + "?sj=true"
@@ -702,19 +644,14 @@ class VinnustundScraper:
                 self.last_successful_request = datetime.now()
                 self.consecutive_failures = 0
             
-            logger.info(f"POST response - Status: {response.status_code}, URL: {response.url}")
-            logger.debug(f"Response length: {len(response.text)} bytes")
-            
             if not self._check_session_valid(response):
-                logger.error("✗ Session validation failed after POST")
                 if not _retry_after_login and self._username and self._password:
-                    logger.info("Session expired; relogin and retrying once...")
+                    logger.info("Session expired; relogin and retry")
                     if self.login():
                         return self.get_shifts(date_from, date_to, _retry_after_login=True)
                 raise Exception("Session expired or invalid. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
             
             if response.status_code != 200:
-                logger.error(f"✗ POST failed with status code {response.status_code}")
                 raise Exception(f"Received status code {response.status_code}")
             
             # Check for common indicators in the response
@@ -722,30 +659,10 @@ class VinnustundScraper:
             has_table_control = 'clsTableControl' in response.text
             has_detail_form = 'detail_form' in response.text
             
-            logger.info(f"Response indicators: Timesheet={has_timesheet}, TableControl={has_table_control}, DetailForm={has_detail_form}")
-            
-            # Parse the HTML
-            logger.info("Step 3: Parsing HTML response...")
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Find ALL tables with class clsTableControl (there might be multiple)
             all_tables = soup.find_all('table', class_='clsTableControl')
-            logger.info(f"Found {len(all_tables)} table(s) with class 'clsTableControl'")
             
             if not all_tables:
-                logger.error("✗ Table with class 'clsTableControl' not found in response")
-                # Try to find any table
-                all_tables_any = soup.find_all('table')
-                logger.warning(f"Found {len(all_tables_any)} tables in response, but none with class 'clsTableControl'")
-                for i, tbl in enumerate(all_tables_any[:3]):
-                    classes = tbl.get('class', [])
-                    logger.debug(f"  Table {i+1}: classes={classes}")
-                
-                # Log more of the response to help debug
-                logger.debug(f"Response contains 'Timesheet': {'Timesheet' in response.text}")
-                logger.debug(f"Response contains 'starfsm_timafaerslur': {'starfsm_timafaerslur' in response.text}")
-                logger.debug(f"Response contains 'clsTableControl': {'clsTableControl' in response.text}")
-                
                 return []
             
             # Find the table that actually has data (rows)
@@ -764,56 +681,20 @@ class VinnustundScraper:
                     logger.debug(f"  → Using table {i} with {len(rows)} rows")
             
             if not table:
-                logger.error("✗ No valid table found")
                 return []
-            
-            logger.info(f"✓ Using table with class 'clsTableControl' ({len(table.find_all('tr'))} rows)")
-            
-            # Check for tbody
-            tbody = table.find('tbody')
-            if tbody:
-                logger.debug("✓ Found tbody element")
-                tbody_rows = tbody.find_all('tr', recursive=False)  # Only direct children
-                logger.debug(f"Found {len(tbody_rows)} direct child rows in tbody")
-                # Also check all rows recursively
-                tbody_rows_all = tbody.find_all('tr')
-                logger.debug(f"Found {len(tbody_rows_all)} total rows in tbody (recursive)")
-            else:
-                logger.debug("⚠ No tbody found, looking for rows directly in table")
-            
-            # Check all rows in table (both direct and nested)
-            all_rows_direct = table.find_all('tr', recursive=False)
-            all_rows_all = table.find_all('tr')
-            logger.debug(f"Total <tr> elements found: {len(all_rows_direct)} direct, {len(all_rows_all)} total (recursive)")
-            
-            # Check if table might be empty
-            table_text = table.get_text(strip=True)
-            if not table_text or len(table_text) < 50:
-                logger.warning("⚠ Table appears to be empty or nearly empty")
-            
-            # Parse table rows
             shifts = self._parse_table(table)
-            
-            logger.info("=" * 60)
-            logger.info(f"✓ Successfully retrieved {len(shifts)} shifts")
-            logger.info("=" * 60)
-            
+            logger.info("Retrieved %d shifts (%s to %s)", len(shifts), date_from, date_to)
             return shifts
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"✗ Request error: {str(e)}")
             raise Exception(f"Failed to retrieve shifts: {str(e)}")
         except Exception as e:
             error_msg = str(e)
-            # On session-related errors, try relogin once if we have credentials
             if not _retry_after_login and self._username and self._password:
-                if 'Session expired' in error_msg or 'Session may be invalid' in error_msg or 'Could not find form' in error_msg or 'invalid' in error_msg.lower():
-                    logger.info("Session-related error; relogin and retrying once...")
+                if "Session expired" in error_msg or "Session may be invalid" in error_msg or "Could not find form" in error_msg or "invalid" in error_msg.lower():
+                    logger.info("Session expired; relogin and retry")
                     if self.login():
                         return self.get_shifts(date_from, date_to, _retry_after_login=True)
-            if 'Session expired' in error_msg or 'Session may be invalid' in error_msg or 'Could not find form' in error_msg:
-                logger.error("⚠ Session expiration detected. Configure USERNAME/PASSWORD in config.py for automatic relogin.")
-            logger.error(f"✗ Error: {error_msg}")
             raise
     
     def _parse_table(self, table: BeautifulSoup) -> List[Dict]:
@@ -837,10 +718,7 @@ class VinnustundScraper:
             rows = table.find_all('tr')
             logger.debug(f"Using all rows from table: {len(rows)} rows")
         
-        logger.info(f"Found {len(rows)} rows in table")
-        
         if len(rows) == 0:
-            logger.warning("⚠ No rows found in table!")
             return []
         
         # Skip header rows (first two rows are usually headers)
@@ -868,8 +746,6 @@ class VinnustundScraper:
             
             data_rows.append(row)
             logger.debug(f"  Row {i+1}: Added as data row with {len(tds)} columns")
-        
-        logger.info(f"Table breakdown: {header_count} header rows, {total_count} total/summary rows, {len(data_rows)} data rows")
         
         # Parse each data row
         for i, row in enumerate(data_rows, 1):
@@ -1037,9 +913,6 @@ class VinnustundScraper:
         Returns:
             True if authenticated, False otherwise
         """
-        logger.info("Testing authentication...")
-        logger.info(f"Current cookies: {len(self.session.cookies)}")
-        
         try:
             self._add_delay(0.5, 1.0)
             
@@ -1052,24 +925,9 @@ class VinnustundScraper:
             # Use retry logic for auth test
             response = self._retry_request(get_auth_test, max_retries=2, base_delay=0.5)
             
-            logger.info(f"Auth test - Status: {response.status_code}, URL: {response.url}")
-            
-            is_valid = self._check_session_valid(response)
-            
-            if is_valid:
-                logger.info("✓ Authentication successful!")
-                # Check if we can see the form
-                if 'detail_form' in response.text:
-                    logger.info("✓ Found detail_form - session is working")
-                else:
-                    logger.warning("⚠ detail_form not found in response")
-            else:
-                logger.error("✗ Authentication failed - session invalid")
-            
-            return is_valid
-            
+            return self._check_session_valid(response)
         except Exception as e:
-            logger.error(f"✗ Authentication test failed: {str(e)}")
+            logger.debug("Auth test failed: %s", e)
             return False
     
     def keep_alive(self):
